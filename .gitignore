@@ -1,0 +1,40 @@
+# IDE
+.vscode
+.kiro*
+.idea
+.agent
+.hypothesis
+
+# Env
+.env
+.env.local
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Data
+data/
+qdrant_storage/
+elastic_data/
+neo4j_data/
+neo4j_logs/
+.DS_Store
+
+# Temp
+logs/
+tmp/
+neo4j.yaml
+run.md
+
+# Auto-generated parquet repack (run `clvn repack` to regenerate)
+data/vietnamese-legal-documents/data/*.repack.parquet
