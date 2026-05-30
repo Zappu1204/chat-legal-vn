@@ -24,6 +24,7 @@ import asyncio
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from ..domain.entities import (
     Answer,
@@ -47,6 +48,7 @@ from ..infra.config import Settings
 from ..infra.logging import get_logger
 from ..services.answer import AnswerEngine
 from ..services.fusion import alpha_fusion, rrf
+from ..services.metadata_lookup import filter_in_path, lookup_by_citation
 from ..services.query_planner import QueryPlanner
 
 log = get_logger(__name__)
@@ -104,10 +106,55 @@ class QueryPipeline:
         retrieved = await self._retrieve(plan)
         timings["retrieve"] = time.perf_counter() - t1
 
+        # 1b. Citation-anchored hard filter. When the planner detected a
+        # specific clause we drop every retrieved chunk whose
+        # ``hierarchical_path`` does not match — the cross-encoder is
+        # otherwise free to promote a *neighbouring* clause whose body
+        # text scores higher semantically and the answer engine then
+        # confidently hallucinates the wrong rule. Falling back to the
+        # unfiltered list when no chunk matches keeps recall non-zero on
+        # questions whose citation is malformed or pre-dates the corpus.
+        if plan.filter.so_ky_hieu and plan.filter.path_substrings and retrieved:
+            anchored_pre = filter_in_path(retrieved, plan.filter.path_substrings)
+            if anchored_pre:
+                log.info(
+                    "retrieve.path_filter_applied",
+                    before=len(retrieved),
+                    after=len(anchored_pre),
+                    path_substrings=plan.filter.path_substrings,
+                )
+                retrieved = anchored_pre
+            else:
+                log.warning(
+                    "retrieve.path_filter_empty",
+                    path_substrings=plan.filter.path_substrings,
+                    note="falling back to unfiltered list",
+                )
+
         # 2. Cross-encoder rerank against the original query.
         t2 = time.perf_counter()
         reranked = await self._rerank(plan.normalized, retrieved)
         timings["rerank"] = time.perf_counter() - t2
+
+        # 2b. When the question carries a strong citation anchor, restrict
+        # retained candidates to those that actually match the cited
+        # clause. Without this guard the cross-encoder routinely promotes
+        # a semantically similar — but legally wrong — Điểm/Khoản from a
+        # neighbouring article and the answer engine then hallucinates.
+        if (
+            plan.filter.so_ky_hieu
+            and plan.filter.path_substrings
+            and reranked
+        ):
+            anchored = filter_in_path(reranked, plan.filter.path_substrings)
+            if anchored:
+                log.info(
+                    "rerank.path_anchored",
+                    before=len(reranked),
+                    after=len(anchored),
+                    path_substrings=plan.filter.path_substrings,
+                )
+                reranked = anchored
 
         # 3. Optional graph expansion + re-rank.
         t3 = time.perf_counter()
@@ -197,10 +244,28 @@ class QueryPipeline:
                 filter=sq.filter,
             )
 
-        tasks = []
+        tasks: list[Any] = []
         for sq, vec in zip(sub_queries, emb_vectors, strict=True):
             tasks.append(_dense(sq, vec))
             tasks.append(_sparse(sq))
+
+        # Metadata-aware lookup: if the planner detected a precise
+        # citation (so_ky_hieu + at least one of Điều/Khoản/Điểm), pull
+        # the exact chunks straight from the lexical store. This adds one
+        # extra task to the parallel batch but lifts citation-style
+        # questions to top-1 recall when the cited text exists in the
+        # corpus, regardless of how the dense retriever scores them.
+        metadata_task_index: int | None = None
+        if plan.filter.so_ky_hieu and plan.filter.path_substrings:
+            metadata_task_index = len(tasks)
+            tasks.append(
+                lookup_by_citation(
+                    lexical_store=self._deps.lexical_store,
+                    query_filter=plan.filter,
+                    top_k_per_path=5,
+                    overall_cap=30,
+                )
+            )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -230,8 +295,26 @@ class QueryPipeline:
                 )
             per_subquery_lists.append(fused)
 
-        # Union across sub-queries via RRF over the fused lists.
-        union = rrf(lists=per_subquery_lists, k=self._settings.hybrid_rrf_k)
+        # Pick up the metadata-anchor list and put it at the head of the
+        # input lists so RRF gives its top-1 the highest score
+        # (1/(k+1) plus contributions from semantic agreement).
+        metadata_hits: list[RetrievalCandidate] = []
+        if metadata_task_index is not None:
+            metadata_hits = _coerce(results[metadata_task_index])
+            log.info(
+                "retrieve.metadata_lookup",
+                so_ky_hieu=plan.filter.so_ky_hieu,
+                path_substrings=plan.filter.path_substrings,
+                hits=len(metadata_hits),
+            )
+
+        all_lists: list[list[RetrievalCandidate]] = []
+        if metadata_hits:
+            all_lists.append(metadata_hits)
+        all_lists.extend(per_subquery_lists)
+
+        # Union across all input lists via RRF.
+        union = rrf(lists=all_lists, k=self._settings.hybrid_rrf_k)
         return union[: self._settings.retriever_top_k * 2]
 
     # ------------------------------------------------------------------

@@ -5,6 +5,11 @@ Performs:
 - Intent classification + decomposition (LLM-driven, with safe fallback)
 - Metadata-filter extraction (regex)
 - HyDE expansion (optional, via LLM)
+- Citation parsing (so_ky_hieu / Điều / Khoản / Điểm) for metadata-aware
+  retrieval. When the user's question references a specific clause
+  (``"Điểm h, i Khoản 2 Điều 7 Nghị định 168/2024/NĐ-CP"``) we lift those
+  anchors into the :class:`QueryFilter` so the retrieval pipeline can
+  hard-filter on ``so_ky_hieu`` and boost by ``hierarchical_path``.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from ..prompts.templates import (
     QUERY_PLANNER_SYSTEM,
     QUERY_PLANNER_USER,
 )
+from .citation_query import parse_query_citation
 
 log = get_logger(__name__)
 
@@ -50,7 +56,23 @@ def normalize_query(text: str) -> str:
 
 
 def extract_filter_heuristic(text: str) -> QueryFilter:
+    """Build a :class:`QueryFilter` from a Vietnamese question via regex.
+
+    Combines:
+
+    * Loose lexical extraction (so_ky_hieu, year, document type,
+      effective-status hints).
+    * Structural citation parsing — ``Điều / Khoản / Điểm`` together with
+      the matching ``hierarchical_path`` substrings — via
+      :func:`citation_query.parse_query_citation`.
+
+    These structural anchors enable the retrieval pipeline to *hard
+    filter* by document number and to *boost* candidates whose
+    ``hierarchical_path`` matches the cited clause.
+    """
     f = QueryFilter()
+
+    # ── coarse extraction ────────────────────────────────────────────────
     if m := _SO_KY_HIEU_RE.search(text):
         f.so_ky_hieu = m.group(1).replace(" ", "")
     f.loai_van_ban = sorted({m.group(1).capitalize() for m in _LOAI_RE.finditer(text)})
@@ -61,6 +83,20 @@ def extract_filter_heuristic(text: str) -> QueryFilter:
     lower = text.lower()
     if any(h in lower for h in _EFFECTIVE_HINTS):
         f.effective_only = True
+
+    # ── citation parsing — overrides looser regex when present ───────────
+    cit = parse_query_citation(text)
+    if cit.so_ky_hieu:
+        f.so_ky_hieu = cit.so_ky_hieu
+    if cit.loai_van_ban and cit.loai_van_ban not in f.loai_van_ban:
+        f.loai_van_ban = sorted({*f.loai_van_ban, cit.loai_van_ban})
+    if cit.dieu:
+        f.dieu = cit.dieu
+    if cit.khoan:
+        f.khoan = cit.khoan
+    if cit.diem:
+        f.diem = cit.diem
+    f.path_substrings = cit.expand_paths()
     return f
 
 
@@ -166,4 +202,12 @@ class QueryPlanner:
             out.year_max = planner["year_max"]  # type: ignore[assignment]
         if isinstance(planner.get("effective_only"), bool):
             out.effective_only = planner["effective_only"]  # type: ignore[assignment]
+        # Structural anchors are always taken from the regex/citation
+        # parser (``base``); the LLM is not asked for them and any
+        # ``planner`` payload is ignored to avoid hallucinated overrides
+        # that would silently dilute hard filters.
+        out.dieu = base.dieu
+        out.khoan = list(base.khoan)
+        out.diem = list(base.diem)
+        out.path_substrings = list(base.path_substrings)
         return out

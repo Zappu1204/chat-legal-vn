@@ -32,7 +32,14 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.1
     llm_max_tokens: int = 2048
     llm_timeout_seconds: float = 60.0
-    llm_max_retries: int = 3
+    llm_max_retries: int = 6
+    llm_retry_min_seconds: float = 1.0
+    llm_retry_max_seconds: float = 30.0
+    # Bounded concurrency on the upstream LLM. MIMO returns 400 with body
+    # `{"error": {"code": "429", "type": "router_queue_limitation"}}` when
+    # its router queue is full; capping in-flight requests keeps us under
+    # the queue admission limit and avoids thundering-herd retries.
+    llm_max_concurrency: int = 4
 
     # ----- Embedding ---------------------------------------------------------
     embedding_base_url: str = Field(...)

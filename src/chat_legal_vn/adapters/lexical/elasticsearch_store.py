@@ -234,6 +234,30 @@ class ElasticsearchLexicalStore(LexicalStoreAdapter):
         top_k: int,
         filter: QueryFilter | None = None,
     ) -> list[RetrievalCandidate]:
+        # Boost ``hierarchical_path`` aggressively so a citation-style
+        # query ("Điều 7 Khoản 2 Điểm h Nghị định 168/2024/NĐ-CP") lifts
+        # chunks whose path matches the cited clause to the top.
+        should_clauses: list[dict[str, Any]] = []
+        if filter is not None and filter.path_substrings:
+            for substring in filter.path_substrings:
+                # match_phrase ensures the tokens stay adjacent in the
+                # path. Each Điểm gets its own clause so multi-clause
+                # citations ("Điểm h, i") match either chunk.
+                should_clauses.append(
+                    {
+                        "match_phrase": {
+                            "hierarchical_path": {"query": substring, "boost": 5.0}
+                        }
+                    }
+                )
+        if filter is not None and filter.so_ky_hieu:
+            # Belt-and-braces: even if the strict ``so_ky_hieu`` term
+            # filter below already pre-narrows the candidate set, scoring
+            # this in `should` keeps relevance high when the query is
+            # citation-only.
+            should_clauses.append(
+                {"term": {"so_ky_hieu": {"value": filter.so_ky_hieu, "boost": 3.0}}}
+            )
         body: dict[str, Any] = {
             "size": top_k,
             "query": {
@@ -243,10 +267,15 @@ class ElasticsearchLexicalStore(LexicalStoreAdapter):
                             "multi_match": {
                                 "query": query,
                                 "type": "best_fields",
-                                "fields": ["text^1.0", "body^1.0", "hierarchical_path^0.5"],
+                                "fields": [
+                                    "text^1.0",
+                                    "body^1.0",
+                                    "hierarchical_path^2.5",
+                                ],
                             }
                         }
                     ],
+                    "should": should_clauses,
                     "filter": _build_filters(filter),
                 }
             },

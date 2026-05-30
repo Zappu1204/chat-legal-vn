@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Sequence
+from datetime import date
 from typing import Any
 
 import httpx
@@ -85,13 +86,18 @@ def _payload_filter(qf: QueryFilter | None) -> qm.Filter | None:
                 key="co_quan_ban_hanh", match=qm.MatchAny(any=qf.co_quan_ban_hanh)
             )
         )
+    # Date range: payload `ngay_ban_hanh` is stored as ISO-8601 strings.
+    # qdrant-client's `Range` only accepts numeric bounds — date filtering
+    # requires `DatetimeRange` together with a payload index of type
+    # ``DATETIME``. Anything else silently degrades to a noop or, with
+    # pydantic v2, raises a ``ValidationError`` at request build time.
     if qf.year_min is not None or qf.year_max is not None:
-        gte = f"{qf.year_min}-01-01" if qf.year_min else None
-        lte = f"{qf.year_max}-12-31" if qf.year_max else None
+        gte = date(qf.year_min, 1, 1) if qf.year_min is not None else None
+        lte = date(qf.year_max, 12, 31) if qf.year_max is not None else None
         must.append(
             qm.FieldCondition(
                 key="ngay_ban_hanh",
-                range=qm.Range(gte=gte, lte=lte),
+                range=qm.DatetimeRange(gte=gte, lte=lte),
             )
         )
     if qf.effective_only:
@@ -101,9 +107,22 @@ def _payload_filter(qf: QueryFilter | None) -> qm.Filter | None:
                 match=qm.MatchValue(value=EffectiveStatus.EFFECTIVE.value),
             )
         )
-    if not must:
+    # Structural anchors. We split the citation expansions into ``should``
+    # (any of the substrings counts) so multi-clause queries like "Điểm h,
+    # i" still match when each Điểm sits in its own chunk.
+    should: list[qm.FieldCondition] = []
+    if qf.path_substrings:
+        for substring in qf.path_substrings:
+            should.append(
+                qm.FieldCondition(
+                    key="hierarchical_path",
+                    match=qm.MatchText(text=substring),
+                )
+            )
+
+    if not must and not should:
         return None
-    return qm.Filter(must=must)
+    return qm.Filter(must=must or None, should=should or None)
 
 
 def _chunk_payload(chunk: ChildChunk) -> dict[str, Any]:
@@ -152,36 +171,119 @@ class QdrantVectorStore(VectorStoreAdapter):
         )
         self._collection = settings.collection_name
 
-    async def ensure_collection(self, *, dim: int) -> None:
-        existing = await self._client.collection_exists(self._collection)
-        if existing:
-            return
-        await self._client.create_collection(
-            collection_name=self._collection,
-            vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
-        )
-        # Create payload indexes for efficient filtering.
-        for field in (
-            "so_ky_hieu",
-            "loai_van_ban",
-            "co_quan_ban_hanh",
-            "effective_status",
-            "ngay_ban_hanh",
-            "document_id",
-            "parent_chunk_id",
-        ):
+    # Field → schema mapping for payload indexes. Keep in sync with the
+    # filter logic in ``_payload_filter`` — adding a new filter dimension
+    # without an index makes Qdrant fall back to a full scan.
+    _PAYLOAD_INDEX_SCHEMA: dict[str, Any] = {
+        "so_ky_hieu": qm.PayloadSchemaType.KEYWORD,
+        "loai_van_ban": qm.PayloadSchemaType.KEYWORD,
+        "co_quan_ban_hanh": qm.PayloadSchemaType.KEYWORD,
+        "effective_status": qm.PayloadSchemaType.KEYWORD,
+        "parent_chunk_id": qm.PayloadSchemaType.KEYWORD,
+        "document_id": qm.PayloadSchemaType.INTEGER,
+        # ISO-8601 string payload — must be DATETIME to support
+        # `qm.DatetimeRange` filters.
+        "ngay_ban_hanh": qm.PayloadSchemaType.DATETIME,
+        "ngay_co_hieu_luc": qm.PayloadSchemaType.DATETIME,
+        "ngay_het_hieu_luc": qm.PayloadSchemaType.DATETIME,
+        # Full-text index over the hierarchical path so a user citation
+        # such as "Điều 7 > Khoản 2 > Điểm h" can be matched directly via
+        # ``MatchText`` (with phrase matching) without falling back to a
+        # full scan.
+        "hierarchical_path": qm.TextIndexParams(
+            type=qm.TextIndexType.TEXT,
+            tokenizer=qm.TokenizerType.WHITESPACE,
+            lowercase=True,
+            phrase_matching=True,
+        ),
+    }
+
+    @staticmethod
+    def _wanted_data_type(schema: Any) -> str:
+        """Render a schema definition to the lowercase data_type string
+        Qdrant exposes via ``payload_schema``."""
+        if isinstance(schema, qm.PayloadSchemaType):
+            return str(schema.value).lower()
+        # qm.TextIndexParams / KeywordIndexParams / IntegerIndexParams …
+        type_attr = getattr(schema, "type", None)
+        if type_attr is not None:
+            return str(getattr(type_attr, "value", type_attr)).lower()
+        return str(schema).lower()
+
+    async def _ensure_payload_indexes(self) -> None:
+        """Idempotent — creates any missing payload indexes.
+
+        Qdrant rejects duplicate index creations with a recognisable
+        error; we swallow those and only escalate genuine failures so
+        a redeploy that adds new index fields can self-heal.
+
+        Also reconciles schema drift: if an existing index uses a
+        different ``PayloadSchemaType`` than the one we want (e.g. an
+        older deployment indexed ``ngay_ban_hanh`` as KEYWORD before we
+        switched to DATETIME) we drop and recreate it.
+        """
+        # Inspect current state once.
+        try:
+            info = await self._client.get_collection(self._collection)
+            current_schema: dict[str, Any] = {}
+            payload_schema = getattr(info, "payload_schema", None) or {}
+            for fname, finfo in payload_schema.items():
+                # ``finfo`` is a ``PayloadIndexInfo`` whose ``data_type``
+                # exposes the active schema as an enum/string.
+                data_type = getattr(finfo, "data_type", None)
+                if data_type is not None:
+                    current_schema[fname] = str(data_type).lower()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("qdrant.payload_schema_unavailable", error=str(exc))
+            current_schema = {}
+
+        for field, schema in self._PAYLOAD_INDEX_SCHEMA.items():
+            wanted = self._wanted_data_type(schema)
+            existing_type = current_schema.get(field)
+            if existing_type and existing_type != wanted:
+                log.warning(
+                    "qdrant.payload_index_recreating",
+                    field=field,
+                    from_=existing_type,
+                    to=wanted,
+                )
+                with contextlib.suppress(Exception):
+                    await self._client.delete_payload_index(
+                        collection_name=self._collection,
+                        field_name=field,
+                    )
+                existing_type = None
+
+            if existing_type == wanted:
+                continue
             try:
                 await self._client.create_payload_index(
                     collection_name=self._collection,
                     field_name=field,
-                    field_schema=(
-                        qm.PayloadSchemaType.INTEGER
-                        if field == "document_id"
-                        else qm.PayloadSchemaType.KEYWORD
-                    ),
+                    field_schema=schema,
                 )
-            except Exception as exc:
-                log.debug("qdrant.index_skip", field=field, error=str(exc))
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                if "already" in msg or "exists" in msg:
+                    continue
+                log.debug(
+                    "qdrant.index_skip",
+                    field=field,
+                    schema=str(schema),
+                    error=str(exc),
+                )
+
+    async def ensure_collection(self, *, dim: int) -> None:
+        existing = await self._client.collection_exists(self._collection)
+        if not existing:
+            await self._client.create_collection(
+                collection_name=self._collection,
+                vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
+            )
+        # Always run — handles both new collections AND old collections
+        # that pre-date a payload-schema change (e.g. swapping
+        # ``ngay_ban_hanh`` from KEYWORD to DATETIME).
+        await self._ensure_payload_indexes()
 
     async def upsert(
         self,

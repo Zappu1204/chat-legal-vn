@@ -170,6 +170,17 @@ class QueryFilter(BaseModel):
     year_min: int | None = None
     year_max: int | None = None
     effective_only: bool = False
+    # Structural anchors lifted from a citation in the question. They
+    # describe locations *inside* a document (e.g. ``Điều 7 > Khoản 2 >
+    # Điểm h``). Stored as raw values so retrieval adapters can build
+    # adapter-specific match logic.
+    dieu: str | None = None
+    khoan: list[str] = Field(default_factory=list)
+    diem: list[str] = Field(default_factory=list)
+    # Substring patterns to require in ``hierarchical_path``. Pre-computed
+    # by the planner via :func:`citation_query.CitationQuery.expand_paths`
+    # so the retrieval layer doesn't recompute them on every search.
+    path_substrings: list[str] = Field(default_factory=list)
 
 
 QueryIntent = Literal[

@@ -77,9 +77,25 @@ class VLLMQwen3RerankerAdapter(RerankerAdapter):
         wrapped_query = self._format_query(query)
         bs = self._settings.reranker_batch_size
 
+        # Reserve tokens for the query+instruction and the model's special
+        # tokens; the rest becomes the per-document budget. We use a
+        # conservative 4 chars/token estimate (Vietnamese tends to encode
+        # more densely than English so this leaves comfortable headroom).
+        char_budget_per_doc = max(
+            512, (self._settings.reranker_max_input_tokens - 1024) * 4
+        )
+        # The reranker server is configured with --max-model-len 8192 in
+        # the standard deployment. Cap accordingly even when the env says
+        # otherwise so we never trip the upstream context limit.
+        char_budget_per_doc = min(char_budget_per_doc, 24_000)
+        truncated_docs = [
+            d[:char_budget_per_doc] if isinstance(d, str) else ""
+            for d in documents
+        ]
+
         all_scores: list[tuple[int, float]] = []
-        for offset in range(0, len(documents), bs):
-            batch = list(documents[offset : offset + bs])
+        for offset in range(0, len(truncated_docs), bs):
+            batch = list(truncated_docs[offset : offset + bs])
             scores = await self._rerank_batch(wrapped_query, batch)
             for local_idx, score in scores:
                 all_scores.append((offset + local_idx, score))
@@ -109,6 +125,17 @@ class VLLMQwen3RerankerAdapter(RerankerAdapter):
                 resp = await self._client.post(url, json=body)
                 if resp.status_code == 404:
                     return await self._fallback_score(query, documents)
+                if resp.status_code == 400:
+                    # vLLM raises 400 when a (query, doc) pair exceeds
+                    # max-model-len, even on a single oversized doc. Fall
+                    # back to a per-pair scorer with hard truncation so
+                    # one bad doc cannot poison the entire batch.
+                    log.warning(
+                        "reranker.batch_400_falling_back_per_pair",
+                        batch_size=len(documents),
+                        body=resp.text[:200],
+                    )
+                    return await self._fallback_score(query, documents)
                 resp.raise_for_status()
                 data = resp.json()
                 results = data.get("results") or []
@@ -131,9 +158,21 @@ class VLLMQwen3RerankerAdapter(RerankerAdapter):
                 "text_1": query,
                 "text_2": doc,
             }
-            resp = await self._client.post(url, json=body)
-            resp.raise_for_status()
-            data = resp.json()
-            score = float(data.get("score") or data.get("data", [{}])[0].get("score", 0.0))
-            out.append((i, score))
+            try:
+                resp = await self._client.post(url, json=body)
+                resp.raise_for_status()
+                data = resp.json()
+                score = float(
+                    data.get("score") or data.get("data", [{}])[0].get("score", 0.0)
+                )
+                out.append((i, score))
+            except httpx.HTTPError as exc:
+                # Per-pair failure: log and assign neutral score so the
+                # candidate is not silently dropped.
+                log.warning(
+                    "reranker.score_failed",
+                    index=i,
+                    error=str(exc),
+                )
+                out.append((i, 0.0))
         return out
