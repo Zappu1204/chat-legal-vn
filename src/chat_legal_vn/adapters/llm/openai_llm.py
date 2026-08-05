@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from openai import (
@@ -189,6 +189,17 @@ class OpenAICompatLLM(LLMAdapter):
     def model_name(self) -> str:
         return self._settings.llm_model_name
 
+    def _maybe_seed(self) -> dict[str, Any]:
+        """Return ``{"seed": N}`` when a non-negative seed is configured.
+
+        A fixed seed combined with ``temperature=0`` makes the upstream
+        (MIMO / vLLM) sampling reproducible run-to-run, which is the main
+        lever for output stability. Vendors that reject the field can be
+        accommodated by setting ``LLM_SEED`` to a negative number.
+        """
+        seed = getattr(self._settings, "llm_seed", -1)
+        return {"seed": int(seed)} if seed is not None and seed >= 0 else {}
+
     # ---- internal request loop --------------------------------------------
 
     async def _retrying_call(
@@ -297,6 +308,7 @@ class OpenAICompatLLM(LLMAdapter):
                 else self._settings.llm_temperature
             ),
             "max_tokens": max_tokens or self._settings.llm_max_tokens,
+            **self._maybe_seed(),
         }
         if stop:
             kwargs["stop"] = list(stop)
@@ -320,9 +332,82 @@ class OpenAICompatLLM(LLMAdapter):
             ],
             "temperature": temperature if temperature is not None else 0.0,
             "max_tokens": max_tokens or self._settings.llm_max_tokens,
+            **self._maybe_seed(),
         }
         resp = await self._retrying_call(
             op="complete_json", kwargs=kwargs, prefer_json_mode=True
         )
         content = resp.choices[0].message.content or ""
         return _extract_json(content)
+
+    async def stream(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        stop: Sequence[str] | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream content deltas from an OpenAI-compatible chat completion.
+
+        The upstream connection is opened with retry/backoff (reusing the
+        same retryability classification as the non-streaming path) and
+        held under the concurrency semaphore for its full lifetime so a
+        single long stream still counts against the in-flight budget. Once
+        the stream is established we yield text deltas as they arrive.
+        """
+        kwargs: dict[str, Any] = {
+            "model": self._settings.llm_model_name,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": (
+                temperature
+                if temperature is not None
+                else self._settings.llm_temperature
+            ),
+            "max_tokens": max_tokens or self._settings.llm_max_tokens,
+            "stream": True,
+        }
+        if stop:
+            kwargs["stop"] = list(stop)
+        kwargs.update(self._maybe_seed())
+
+        max_attempts = max(1, int(self._settings.llm_max_retries))
+        wait_strategy = wait_random_exponential(
+            multiplier=self._settings.llm_retry_min_seconds,
+            max=self._settings.llm_retry_max_seconds,
+        )
+
+        async def _open_stream() -> Any:
+            # Establish the streaming response with retries. The OpenAI SDK
+            # returns an async stream object; errors raised here (connection,
+            # 5xx, rate-limit) are retryable per `_is_retryable`.
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(max_attempts),
+                wait=wait_strategy,
+                retry=retry_if_exception(_is_retryable),
+                reraise=True,
+                before_sleep=lambda rs: log.warning(
+                    "llm.retrying",
+                    op="stream",
+                    attempt=rs.attempt_number,
+                    error=str(rs.outcome.exception()) if rs.outcome else None,
+                ),
+            ):
+                with attempt:
+                    return await self._client.chat.completions.create(**kwargs)
+            msg = "llm: stream retry loop exited without a result"
+            raise RuntimeError(msg)
+
+        async with self._semaphore:
+            stream = await _open_stream()
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                piece = getattr(delta, "content", None)
+                if piece:
+                    yield piece

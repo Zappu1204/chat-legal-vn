@@ -34,6 +34,7 @@ from tenacity import (
 from ...domain.ports import RerankerAdapter
 from ...infra.config import Settings
 from ...infra.logging import get_logger
+from ...infra.tokens import estimate_tokens, max_chars_for_tokens
 
 log = get_logger(__name__)
 
@@ -77,17 +78,21 @@ class VLLMQwen3RerankerAdapter(RerankerAdapter):
         wrapped_query = self._format_query(query)
         bs = self._settings.reranker_batch_size
 
-        # Reserve tokens for the query+instruction and the model's special
-        # tokens; the rest becomes the per-document budget. We use a
-        # conservative 4 chars/token estimate (Vietnamese tends to encode
-        # more densely than English so this leaves comfortable headroom).
-        char_budget_per_doc = max(
-            512, (self._settings.reranker_max_input_tokens - 1024) * 4
+        # The reranker scores (query, document) PAIRS, so the budget must
+        # cover BOTH the wrapped query and the document plus the model's
+        # template/special tokens. We compute the per-document character
+        # budget from the calibrated chars/token ratio (~2.6 for VN legal
+        # text), subtract what the query already consumes, and reserve a
+        # margin for the chat template the server injects.
+        query_tokens = estimate_tokens(wrapped_query)
+        template_reserve_tokens = 256
+        doc_token_budget = (
+            self._settings.reranker_max_input_tokens
+            - query_tokens
+            - template_reserve_tokens
         )
-        # The reranker server is configured with --max-model-len 8192 in
-        # the standard deployment. Cap accordingly even when the env says
-        # otherwise so we never trip the upstream context limit.
-        char_budget_per_doc = min(char_budget_per_doc, 24_000)
+        doc_token_budget = max(128, doc_token_budget)
+        char_budget_per_doc = max_chars_for_tokens(doc_token_budget)
         truncated_docs = [
             d[:char_budget_per_doc] if isinstance(d, str) else ""
             for d in documents
@@ -100,7 +105,16 @@ class VLLMQwen3RerankerAdapter(RerankerAdapter):
             for local_idx, score in scores:
                 all_scores.append((offset + local_idx, score))
 
-        all_scores.sort(key=lambda x: x[1], reverse=True)
+        # Stable ordering. The vLLM reranker is NOT bit-exact run-to-run:
+        # GPU kernels + continuous batching introduce float noise on the
+        # order of 1e-3 in the relevance score. Two near-tied documents
+        # therefore swap places between identical calls, which propagates
+        # all the way to a different final answer. We quantise the score
+        # to a fixed precision so sub-`rank_score_round` noise no longer
+        # changes the ordering, then break exact ties by the original
+        # document index (deterministic given a fixed candidate list).
+        ndigits = max(0, int(self._settings.reranker_score_round))
+        all_scores.sort(key=lambda x: (-round(x[1], ndigits), x[0]))
         if top_n is not None:
             all_scores = all_scores[:top_n]
         return all_scores

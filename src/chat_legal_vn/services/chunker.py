@@ -23,6 +23,7 @@ from ..domain.entities import (
     LegalNode,
     ParentChunk,
 )
+from ..infra.tokens import estimate_tokens, max_chars_for_tokens
 
 # ---------------------------------------------------------------------------
 # IDs
@@ -85,8 +86,15 @@ _SENTENCE_BOUNDARY = re.compile(r"(?<=[\.!?…])\s+")
 
 
 def _approx_token_count(text: str) -> int:
-    """A coarse token estimate. We treat 4 chars ≈ 1 token (conservative)."""
-    return max(1, len(text) // 4)
+    """Estimate token count using the corpus-calibrated chars/token ratio.
+
+    The previous implementation assumed 4 chars/token, but Vietnamese
+    legal text measures ~2.85 chars/token against the Qwen3 tokenizer, so
+    the old estimate undercounted tokens by ~40% and let chunks grow well
+    past the intended ``max_input_tokens`` budget. ``estimate_tokens``
+    uses a conservative 2.6 ratio so we err on the side of smaller chunks.
+    """
+    return estimate_tokens(text)
 
 
 def _split_by_sentence(text: str, max_tokens: int) -> list[str]:
@@ -94,8 +102,9 @@ def _split_by_sentence(text: str, max_tokens: int) -> list[str]:
         return [text]
     sentences = _SENTENCE_BOUNDARY.split(text)
     if len(sentences) == 1:
-        # No sentence boundaries detected: hard-split on a char budget.
-        max_chars = max_tokens * 4
+        # No sentence boundaries detected: hard-split on a char budget
+        # derived from the calibrated chars/token ratio.
+        max_chars = max_chars_for_tokens(max_tokens)
         return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
     chunks: list[str] = []
     current: list[str] = []
@@ -118,7 +127,7 @@ def _split_by_sentence(text: str, max_tokens: int) -> list[str]:
     # overflow on long single-sentence runs (some vbpl.vn docs ship a
     # 100k-character "sentence" containing no period). The iterative
     # char-budget split is bounded and gives an identical result.
-    max_chars = max_tokens * 4
+    max_chars = max_chars_for_tokens(max_tokens)
     out: list[str] = []
     for c in chunks:
         if _approx_token_count(c) > max_tokens:
@@ -176,6 +185,40 @@ def _summary(text: str, *, max_chars: int = 280) -> str:
     if last_period >= max_chars // 2:
         return cut[: last_period + 1]
     return cut + "…"
+
+
+def _diem_label(node: LegalNode) -> str:
+    """Reconstruct a point marker like ``a)`` from a parsed Điểm node.
+
+    The HTML parser strips the leading marker into ``node.number`` (e.g.
+    ``"a"``), so we re-attach it when assembling a clause so the embedded
+    text reads like the source ("a) ...; b) ...") and citations stay
+    legible.
+    """
+    if node.level == "diem" and node.number:
+        return f"{node.number})"
+    return ""
+
+
+def _clause_text(khoan: LegalNode) -> str:
+    """Assemble the full text of a Khoản: its own body plus every nested
+    Điểm (and any deeper descendant) in document order.
+
+    This is the key change behind Khoản-level chunking: a clause like
+    "Phạt tiền từ 4-6 triệu đối với người điều khiển xe ... thực hiện một
+    trong các hành vi sau: a) ...; c) Không chấp hành hiệu lệnh đèn tín
+    hiệu; ..." stays in ONE chunk, so the penalty amount, the subject and
+    the prohibited behaviour are never separated.
+    """
+    parts: list[str] = []
+    if khoan.body:
+        parts.append(khoan.body)
+    for desc in _flatten_descendants(khoan):
+        if not desc.body:
+            continue
+        label = _diem_label(desc)
+        parts.append(f"{label} {desc.body}" if label else desc.body)
+    return "\n".join(parts).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -265,36 +308,36 @@ class HierarchicalChunker:
                 )
             )
 
-            # ---- Child chunks -------------------------------------------------
+            # ---- Child chunks (Khoản-level) ----------------------------------
+            # Retrieval unit = one Clause (Khoản). All nested Điểm are
+            # folded into the clause body so the chunk is self-contained:
+            # it carries the penalty band, the subject ("người điều khiển
+            # xe mô tô...") and every prohibited behaviour together. This
+            # is what lets the embedder and the cross-encoder recognise a
+            # clause in isolation. Articles with no Khoản emit a single
+            # article-level child.
             khoans = [c for c in article.children if c.level == "khoan"]
-            child_units: list[tuple[LegalNode, LegalNode | None]] = []
-            if not khoans:
-                # Article has no khoan: emit one child for the article itself.
-                child_units.append((article, None))
-            else:
-                for kh in khoans:
-                    diems = [c for c in kh.children if c.level == "diem"]
-                    if diems:
-                        for dm in diems:
-                            child_units.append((kh, dm))
-                    else:
-                        child_units.append((kh, None))
+            child_units: list[LegalNode] = list(khoans) if khoans else [article]
 
-            for unit_index, (kh, dm) in enumerate(child_units):
-                node = dm if dm is not None else kh
-                hier = node.hierarchical_path
-                body = node.body or ""
-                if not body and node is article:
+            for unit_index, kh in enumerate(child_units):
+                is_article_unit = kh is article
+                hier = kh.hierarchical_path
+                if is_article_unit:
                     body = article_body
+                else:
+                    body = _clause_text(kh) or kh.body or ""
 
                 # Header injected for embedding/BM25 — gives lexical and
-                # semantic signal about location.
+                # semantic signal about location and the owning document.
                 header = f"[{hier}]"
                 if article.heading:
                     header += f" | {article.heading}"
                 if parent_meta.so_ky_hieu:
                     header += f" | {parent_meta.so_ky_hieu}"
 
+                # Prepend the article summary so a terse clause still
+                # inherits the article's framing ("Xử phạt người điều
+                # khiển xe mô tô... Phạt tiền từ...").
                 full_text = f"{header}\n{article_summary}\n{body}".strip()
                 splits = _split_by_sentence(full_text, max_tokens)
 
@@ -302,8 +345,8 @@ class HierarchicalChunker:
                     cid = child_chunk_id(
                         document_id=document.document_id,
                         dieu_number=article.number,
-                        khoan_number=kh.number if kh is not article else None,
-                        diem_number=dm.number if dm is not None else None,
+                        khoan_number=None if is_article_unit else kh.number,
+                        diem_number=None,
                         split_index=split_idx,
                         version=self._chunking_version,
                     )

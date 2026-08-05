@@ -69,3 +69,41 @@ uvicorn chat_legal_vn.api.main:app --host 0.0.0.0 --port 8080
 ## License
 
 Source code: Apache-2.0. Dataset: CC-BY-4.0.
+
+## Web application (Backend + Frontend)
+
+Beyond the RAG core and CLI, the project ships a production-style web stack:
+
+- **`backend/`** — FastAPI delivery layer: JWT auth + RBAC (`user`/`admin`),
+  a Postgres-backed dynamic config store with **zero-downtime hot-reload** of
+  the adapter pipeline, and a **streaming chat API** (SSE) that emits retrieved
+  source cards *before* the answer text. See `backend/README.md`.
+- **`frontend/`** — Next.js 15 (App Router, React 19) chat UI with interactive
+  source cards, IRAC markdown rendering, and an admin dashboard (config editor,
+  user management, ingest trigger). See `frontend/README.md`.
+
+The core itself gained a streaming path (`LLMAdapter.stream`,
+`AnswerEngine.stream_answer`, `QueryPipeline.run_stream`) used by the web layer;
+the blocking `run()` JSON path is unchanged.
+
+```
+chat-legal-vn/
+├── src/chat_legal_vn/   # RAG core (domain, application, adapters)
+├── backend/             # FastAPI: auth, dynamic config, streaming chat
+└── frontend/            # Next.js 15 web UI + admin dashboard
+```
+
+### Quick start (full stack)
+
+```bash
+# Backing services (Qdrant, Elasticsearch, Neo4j, Postgres)
+docker compose up -d
+
+# Backend
+uv pip install -e ".[dev]" && uv pip install -e "backend/[dev]"
+cp .env.example .env && cp backend/.env.example backend/.env
+uvicorn app.main:app --port 8080 --app-dir backend
+
+# Frontend
+cd frontend && npm install && npm run dev   # http://localhost:3000
+```

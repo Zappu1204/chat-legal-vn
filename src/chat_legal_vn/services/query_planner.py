@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import OrderedDict
 
 from ..domain.entities import QueryFilter, QueryIntent, QueryPlan, SubQuery
 from ..domain.ports import LLMAdapter
@@ -110,14 +111,50 @@ class QueryPlanner:
         decompose_enabled: bool = True,
         hyde_enabled: bool = True,
         hyde_num: int = 1,
+        hyde_temperature: float = 0.0,
+        cache_size: int = 256,
     ) -> None:
         self._llm = llm
         self._decompose_enabled = decompose_enabled
         self._hyde_enabled = hyde_enabled
         self._hyde_num = max(0, hyde_num)
+        self._hyde_temperature = hyde_temperature
+        self._cache_size = max(0, cache_size)
+        # Insertion-ordered cache → cheap FIFO eviction. Keyed by the
+        # normalised query so identical questions reuse the same plan and
+        # become fully deterministic despite upstream LLM drift.
+        self._cache: OrderedDict[str, QueryPlan] = OrderedDict()
+
+    def _cache_get(self, key: str) -> QueryPlan | None:
+        if self._cache_size == 0:
+            return None
+        plan = self._cache.get(key)
+        if plan is not None:
+            self._cache.move_to_end(key)
+        return plan
+
+    def _cache_put(self, key: str, plan: QueryPlan) -> None:
+        if self._cache_size == 0:
+            return
+        self._cache[key] = plan
+        self._cache.move_to_end(key)
+        while len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)
 
     async def plan(self, query: str) -> QueryPlan:
         normalized = normalize_query(query)
+
+        cached = self._cache_get(normalized)
+        if cached is not None:
+            log.info("query_planner.cache_hit", normalized=normalized)
+            # Return a copy so callers can't mutate the cached instance.
+            return cached.model_copy(deep=True)
+
+        plan = await self._plan_uncached(normalized, original=query)
+        self._cache_put(normalized, plan)
+        return plan
+
+    async def _plan_uncached(self, normalized: str, *, original: str) -> QueryPlan:
         regex_filter = extract_filter_heuristic(normalized)
 
         intent: QueryIntent = "other"
@@ -167,7 +204,7 @@ class QueryPlanner:
                     passage = await self._llm.complete(
                         system=HYDE_SYSTEM,
                         user=HYDE_USER.format(query=normalized),
-                        temperature=0.2,
+                        temperature=self._hyde_temperature,
                         max_tokens=256,
                     )
                     if passage.strip():
@@ -177,7 +214,7 @@ class QueryPlanner:
                     break
 
         return QueryPlan(
-            original=query,
+            original=original,
             normalized=normalized,
             intent=intent,
             sub_queries=sub_queries,

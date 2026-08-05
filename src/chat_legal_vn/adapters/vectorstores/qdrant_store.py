@@ -285,6 +285,21 @@ class QdrantVectorStore(VectorStoreAdapter):
         # ``ngay_ban_hanh`` from KEYWORD to DATETIME).
         await self._ensure_payload_indexes()
 
+    async def recreate_collection(self, *, dim: int) -> None:
+        """Drop the collection (if any) and create it fresh.
+
+        Used before a full re-ingest with a new ``chunking_version`` so the
+        index doesn't accumulate stale chunks from the previous scheme.
+        """
+        with contextlib.suppress(Exception):
+            await self._client.delete_collection(self._collection)
+        await self._client.create_collection(
+            collection_name=self._collection,
+            vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
+        )
+        await self._ensure_payload_indexes()
+        log.info("qdrant.collection_recreated", collection=self._collection)
+
     async def upsert(
         self,
         *,

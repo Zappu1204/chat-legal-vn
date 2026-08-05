@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Sequence
 from typing import Any
 
@@ -124,6 +125,18 @@ class ElasticsearchLexicalStore(LexicalStoreAdapter):
         if await self._client.indices.exists(index=self._index):
             return
         await self._client.indices.create(index=self._index, body=_VN_ANALYZER)
+
+    async def recreate_index(self) -> None:
+        """Delete the index (if any) and create it fresh.
+
+        Used before a full re-ingest with a new ``chunking_version`` so the
+        lexical store doesn't keep stale chunks from the previous scheme.
+        """
+        with contextlib.suppress(Exception):
+            if await self._client.indices.exists(index=self._index):
+                await self._client.indices.delete(index=self._index)
+        await self._client.indices.create(index=self._index, body=_VN_ANALYZER)
+        log.info("elasticsearch.index_recreated", index=self._index)
 
     async def disable_refresh(self) -> None:
         """Pause periodic refresh during a long bulk-ingest run.

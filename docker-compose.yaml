@@ -65,3 +65,24 @@ services:
     volumes:
       - ./neo4j_data:/data
       - ./neo4j_logs:/logs
+
+  ###########################################################################
+  # POSTGRES – APPLICATION DB (users, conversations, system_config)
+  ###########################################################################
+  postgres:
+    image: postgres:17.2
+    container_name: clvn_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: clvn
+      POSTGRES_PASSWORD: clvn
+      POSTGRES_DB: clvn
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clvn -d clvn"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

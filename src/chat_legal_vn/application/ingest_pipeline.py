@@ -169,7 +169,23 @@ class IngestPipeline:
             max_input_tokens=deps.settings.embedding_max_input_tokens,
         )
 
-    async def setup(self) -> None:
+    async def setup(self, *, recreate: bool = False) -> None:
+        if recreate:
+            log.warning("ingest.recreate_requested", note="dropping existing index data")
+            recreate_vec = getattr(self._deps.vector_store, "recreate_collection", None)
+            if recreate_vec is not None:
+                await recreate_vec(dim=self._deps.embedding.dim)
+            else:
+                await self._deps.vector_store.ensure_collection(dim=self._deps.embedding.dim)
+            recreate_lex = getattr(self._deps.lexical_store, "recreate_index", None)
+            if recreate_lex is not None:
+                await recreate_lex()
+            else:
+                await self._deps.lexical_store.ensure_index()
+            if isinstance(self._deps.doc_store, QdrantParentDocStore):
+                await self._deps.doc_store.recreate_collection()
+            return
+
         await self._deps.vector_store.ensure_collection(dim=self._deps.embedding.dim)
         await self._deps.lexical_store.ensure_index()
         if isinstance(self._deps.doc_store, QdrantParentDocStore):
@@ -228,16 +244,21 @@ class IngestPipeline:
         show_progress: bool = True,
         console: Console | None = None,
         log_progress_every_seconds: float = 5.0,
+        recreate: bool = False,
     ) -> IngestStats:
         stats = IngestStats()
         start = time.perf_counter()
 
-        await self.setup()
+        await self.setup(recreate=recreate)
 
+        # A fresh index has nothing to skip against; also avoids a wasted
+        # scroll over an empty collection.
         existing_ids: set[int] = (
-            await self._load_existing_ids() if skip_existing else set()
+            await self._load_existing_ids()
+            if (skip_existing and not recreate)
+            else set()
         )
-        if skip_existing:
+        if skip_existing and not recreate:
             log.info(
                 "ingest.skip_existing_loaded",
                 already_indexed_documents=len(existing_ids),

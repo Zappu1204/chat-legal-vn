@@ -34,7 +34,13 @@ def rrf(
     for chunk_id, fused_score in scores.items():
         c = by_id[chunk_id].model_copy(update={"score": fused_score, "source": "rrf"})
         fused.append(c)
-    fused.sort(key=lambda x: x.score, reverse=True)
+    # Sort by score desc, then by chunk_id asc as a deterministic
+    # tie-breaker. RRF produces many exact-tie scores (1/(k+r) collides
+    # across lists); without a stable secondary key the final order would
+    # depend on dict insertion order — which itself depends on the
+    # (non-deterministic) retrieval order — making the whole pipeline
+    # unstable run-to-run.
+    fused.sort(key=lambda x: (-x.score, x.chunk_id))
     return fused
 
 
@@ -67,5 +73,5 @@ def alpha_fusion(
     for chunk_id, c in by_id.items():
         score = alpha_dense * nd.get(chunk_id, 0.0) + alpha_sparse * ns.get(chunk_id, 0.0)
         fused.append(c.model_copy(update={"score": score, "source": "rrf"}))
-    fused.sort(key=lambda x: x.score, reverse=True)
+    fused.sort(key=lambda x: (-x.score, x.chunk_id))
     return fused

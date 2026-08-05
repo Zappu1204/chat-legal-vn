@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     embedding_batch_size: int = 64
     embedding_concurrency: int = 4
     embedding_max_input_tokens: int = 8192
+    # Hard server limit (vLLM ``--max-model-len``). Inputs are truncated
+    # to this many tokens as a last-resort safety net so a single oversize
+    # string can never return HTTP 400 and abort the whole batch.
+    embedding_server_max_tokens: int = 32768
     embedding_timeout_seconds: float = 60.0
     embedding_max_retries: int = 4
     embedding_task_instruction: str = (
@@ -67,6 +71,12 @@ class Settings(BaseSettings):
         "Given a Vietnamese legal question, judge whether the candidate "
         "Vietnamese legal passage contains the rule that answers the question."
     )
+    # Decimal places to round reranker scores to before sorting. The vLLM
+    # reranker is not bit-exact run-to-run (GPU/batching float noise ~1e-3);
+    # rounding removes sub-threshold jitter so the ranking — and therefore
+    # the final answer — is reproducible. 3 keeps genuinely different
+    # scores distinct while absorbing the noise.
+    reranker_score_round: int = 3
 
     # ----- Vector store ------------------------------------------------------
     vector_store_type: Literal["qdrant"] = "qdrant"
@@ -100,10 +110,30 @@ class Settings(BaseSettings):
     hybrid_rrf_k: int = 60
     hybrid_alpha_dense: float = 0.7
     hybrid_alpha_sparse: float = 0.3
-    retriever_top_k: int = 40
-    reranker_top_k: int = 5
-    reranker_threshold: float = 0.7
+    retriever_top_k: int = 60
+    reranker_top_k: int = 8
+    reranker_threshold: float = 0.3
+    # Weight of the retrieval-rank prior when blending with the
+    # cross-encoder score (0 = trust reranker only, 1 = trust retrieval
+    # order only). A small value demotes mis-calibrated reranker outliers
+    # that score high against any query while sitting deep in retrieval.
+    rerank_retrieval_blend: float = 0.25
     diversity_max_per_parent: int = 2
+    # ----- Effective-status ranking bias -------------------------------------
+    # Vietnamese law re-issues decrees over time; the corpus contains many
+    # superseded versions of the same topic (e.g. traffic decrees
+    # 15/2003, 34/2010, 171/2013, 46/2016, 100/2019, 168/2024). Semantic
+    # similarity alone ranks them almost identically, so an EXPIRED decree
+    # frequently outranks the in-force one. After reranking we re-score
+    # candidates by multiplying the rerank score with a status weight so
+    # currently-effective law floats to the top WITHOUT discarding expired
+    # text entirely (historical questions still work).
+    effective_bias_enabled: bool = True
+    effective_weight_effective: float = 1.0
+    effective_weight_partially_expired: float = 0.85
+    effective_weight_not_yet_effective: float = 0.8
+    effective_weight_expired: float = 0.55
+    effective_weight_unknown: float = 0.9
 
     # ----- Ingest pipeline ---------------------------------------------------
     # Number of flush jobs (embed → upsert across stores) that may run
@@ -120,6 +150,23 @@ class Settings(BaseSettings):
     query_decompose_enabled: bool = True
     query_hyde_enabled: bool = True
     query_hyde_num: int = 1
+    # HyDE temperature. A non-zero value makes the generated hypothetical
+    # passage — and therefore the retrieval vector — vary between runs,
+    # which is the single biggest source of answer non-determinism. Keep
+    # at 0.0 for reproducible retrieval.
+    query_hyde_temperature: float = 0.0
+    # In-process cache of query plans keyed by normalised question text.
+    # The upstream LLM (MIMO) is not bit-reproducible even at temperature 0
+    # + fixed seed (cluster routing / batching), so the decomposition and
+    # HyDE passages drift run-to-run. Caching the plan makes a repeated
+    # question deterministic, removes a planner+HyDE round-trip, and cuts
+    # latency. Set size to 0 to disable.
+    query_plan_cache_size: int = 256
+    # Optional deterministic seed forwarded to the LLM on every call.
+    # MIMO accepts the OpenAI ``seed`` field; combined with temperature 0
+    # it removes most run-to-run drift. Set to a negative value to omit
+    # the parameter entirely (some vendors reject it).
+    llm_seed: int = 7
 
     # ----- GraphRAG ----------------------------------------------------------
     graph_expand_enabled: bool = True
@@ -127,7 +174,7 @@ class Settings(BaseSettings):
     graph_expand_limit: int = 10
 
     # ----- Versions ----------------------------------------------------------
-    chunking_version: str = "v1"
+    chunking_version: str = "v2-khoan"
     embedding_version: str = "qwen3-emb-8b-4096-v1"
     prompt_version: str = "irac-v1"
     policy_version: str = "hybrid-rrf-rerank-v1"

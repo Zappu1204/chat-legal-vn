@@ -188,6 +188,15 @@ def ingest(
         "--progress/--no-progress",
         help="Render a Rich progress bar to stderr.",
     ),
+    recreate: bool = typer.Option(
+        False,
+        "--recreate",
+        help=(
+            "Drop and recreate the vector/lexical/doc stores before ingesting. "
+            "Use when changing CHUNKING_VERSION so stale chunks from a previous "
+            "scheme don't pollute retrieval. Implies --no-skip-existing."
+        ),
+    ),
 ) -> None:
     """Run the offline indexing pipeline."""
     settings = get_settings()
@@ -200,9 +209,10 @@ def ingest(
             stats = await pipeline.run(
                 limit=limit if limit > 0 else None,
                 flush_every=flush_every,
-                skip_existing=skip_existing,
+                skip_existing=skip_existing and not recreate,
                 show_progress=progress,
                 console=err_console,
+                recreate=recreate,
             )
             console.print_json(json.dumps(asdict(stats)))
         finally:

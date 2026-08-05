@@ -32,6 +32,7 @@ from tenacity import (
 from ...domain.ports import EmbeddingAdapter
 from ...infra.config import Settings
 from ...infra.logging import get_logger
+from ...infra.tokens import max_chars_for_tokens
 
 log = get_logger(__name__)
 
@@ -70,6 +71,13 @@ class VLLMQwen3EmbeddingAdapter(EmbeddingAdapter):
         self._semaphore = asyncio.Semaphore(
             max(1, settings.embedding_concurrency)
         )
+        # Hard character ceiling: a last-resort truncation so a single
+        # pathological input (e.g. a malformed doc that escaped chunking)
+        # can never exceed the server's max_model_len and 400 the batch.
+        # Reserve a margin for the instruction prefix added to queries.
+        self._max_chars = max_chars_for_tokens(
+            max(256, settings.embedding_server_max_tokens - 64)
+        )
 
     @property
     def dim(self) -> int:
@@ -79,11 +87,32 @@ class VLLMQwen3EmbeddingAdapter(EmbeddingAdapter):
     def model_name(self) -> str:
         return self._settings.embedding_model_name
 
+    def _clip(self, inputs: Sequence[str]) -> list[str]:
+        """Hard-truncate any input that would exceed the server limit.
+
+        This should almost never fire — the chunker already sizes texts to
+        ``embedding_max_input_tokens`` — but it guarantees a single rogue
+        input cannot abort an entire batch with HTTP 400.
+        """
+        out: list[str] = []
+        for t in inputs:
+            if len(t) > self._max_chars:
+                log.warning(
+                    "embedding.input_truncated",
+                    original_chars=len(t),
+                    capped_chars=self._max_chars,
+                )
+                out.append(t[: self._max_chars])
+            else:
+                out.append(t)
+        return out
+
     async def _embed_one_batch(
         self, inputs: Sequence[str]
     ) -> list[list[float]]:
         if not inputs:
             return []
+        inputs = self._clip(inputs)
         async with self._semaphore:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(self._settings.embedding_max_retries),

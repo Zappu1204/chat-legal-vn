@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from typing import Any
 
 from ..domain.entities import (
@@ -99,8 +99,14 @@ class TokenOverlapReranker(RerankerAdapter):
 
 
 class EchoLLM(LLMAdapter):
-    def __init__(self, *, json_response: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        json_response: dict[str, Any] | None = None,
+        stream_text: str | None = None,
+    ) -> None:
         self._json_response = json_response or {}
+        self._stream_text = stream_text
 
     async def complete(
         self,
@@ -123,6 +129,19 @@ class EchoLLM(LLMAdapter):
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
         return dict(self._json_response)
+
+    async def stream(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        stop: Sequence[str] | None = None,
+    ) -> AsyncIterator[str]:
+        text = self._stream_text if self._stream_text is not None else f"[echo] {user[:200]}"
+        for token in re.findall(r"\S+\s*", text):
+            yield token
 
 
 # ---------------------------------------------------------------------------

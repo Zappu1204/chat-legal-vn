@@ -6,7 +6,7 @@ are confined to `chat_legal_vn.adapters.*`.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from .entities import (
@@ -49,6 +49,23 @@ class LLMAdapter(Protocol):
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
         """JSON-mode chat completion. Returns a parsed dict."""
+        ...
+
+    def stream(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        stop: Sequence[str] | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream a chat completion as text deltas.
+
+        Returns an async iterator yielding incremental content chunks.
+        Implementations should surface the same retry / rate-limit
+        handling as :meth:`complete` for the initial connection.
+        """
         ...
 
 

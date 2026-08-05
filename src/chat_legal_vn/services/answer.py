@@ -9,7 +9,7 @@ Heavy lifting is performed by the LLM; this module is responsible for
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from ..domain.entities import (
@@ -22,7 +22,12 @@ from ..domain.entities import (
 )
 from ..domain.ports import LLMAdapter
 from ..infra.logging import get_logger
-from ..prompts.templates import ANSWER_SYSTEM, ANSWER_USER
+from ..prompts.templates import (
+    ANSWER_STREAM_SYSTEM,
+    ANSWER_STREAM_USER,
+    ANSWER_SYSTEM,
+    ANSWER_USER,
+)
 from .citation import parse_citations
 
 log = get_logger(__name__)
@@ -41,15 +46,47 @@ def _format_evidence(
         status = meta.get("effective_status") or EffectiveStatus.UNKNOWN.value
         path = cand.hierarchical_path
         summary = parent.summary if parent else ""
-        body = cand.body or (parent.body if parent else "")
-        head = (
-            f"[{i}] {loai} {skh} | {path} | effective_status={status}"
-        )
-        block = head + (
-            f"\nTóm tắt Điều: {summary}" if summary else ""
-        ) + f"\nNội dung: {body}"
+        # Parent-child retrieval pays off here: we retrieve on the precise
+        # child clause but feed the LLM the WHOLE article (parent.body) so
+        # it sees the penalty amounts and the "xe mô tô / xe gắn máy"
+        # subject that live in sibling clauses. The matched clause is shown
+        # separately so the model knows which part triggered the hit.
+        parent_body = parent.body if parent else ""
+        matched_clause = cand.body or ""
+        head = f"[{i}] {loai} {skh} | {path} | effective_status={status}"
+        block = head
+        if summary:
+            block += f"\nTóm tắt Điều: {summary}"
+        if matched_clause and matched_clause.strip() != (parent_body or "").strip():
+            block += f"\nĐoạn khớp: {matched_clause}"
+        block += f"\nNội dung Điều: {parent_body or matched_clause}"
         lines.append(block)
     return "\n\n".join(lines)
+
+
+def effective_status_warning(
+    candidates: Sequence[RetrievalCandidate],
+) -> str | None:
+    """Return a Markdown blockquote warning when retained evidence is not
+    fully effective, or ``None`` when every chunk is effective.
+    """
+    statuses = {
+        (c.metadata or {}).get("effective_status", EffectiveStatus.UNKNOWN.value)
+        for c in candidates
+    }
+    if not statuses:
+        return None
+    if EffectiveStatus.EFFECTIVE.value not in statuses:
+        return (
+            "> ⚠️ **Cảnh báo:** Toàn bộ căn cứ truy hồi được có thể KHÔNG "
+            "còn hiệu lực. Vui lòng kiểm chứng và tham khảo luật sư."
+        )
+    if any(s != EffectiveStatus.EFFECTIVE.value for s in statuses):
+        return (
+            "> ⚠️ **Lưu ý:** Một số căn cứ có thể không còn hiệu lực toàn bộ. "
+            "Hãy đối chiếu hiệu lực trước khi áp dụng."
+        )
+    return None
 
 
 def _map_response(payload: dict[str, Any]) -> Answer:
@@ -151,6 +188,45 @@ class AnswerEngine:
             answer.warnings.append("some_retained_chunks_non_effective")
 
         return answer
+
+    async def stream_answer(
+        self,
+        *,
+        query: str,
+        candidates: Sequence[RetrievalCandidate],
+        parents: dict[str, ParentChunk],
+    ) -> AsyncIterator[str]:
+        """Stream a Markdown IRAC answer token-by-token.
+
+        Yields incremental text deltas. When there is no evidence a single
+        graceful-degradation message is yielded so the caller need not
+        special-case the empty stream. Effective-status warnings are
+        prepended as a Markdown blockquote before the model output so the
+        user sees them even if the model omits them.
+        """
+        evidence = _format_evidence(candidates, parents)
+        if not evidence:
+            yield (
+                "Không tìm thấy quy định đủ căn cứ trong dữ liệu. "
+                "Hệ thống chưa truy hồi được tài liệu pháp luật phù hợp với câu hỏi."
+            )
+            return
+
+        warning = effective_status_warning(candidates)
+        if warning:
+            yield warning + "\n\n"
+
+        try:
+            async for delta in self._llm.stream(
+                system=ANSWER_STREAM_SYSTEM,
+                user=ANSWER_STREAM_USER.format(evidence=evidence, query=query),
+                temperature=0.0,
+                max_tokens=2048,
+            ):
+                yield delta
+        except Exception as exc:
+            log.error("answer.stream_failed", error=str(exc))
+            yield "\n\n_Hệ thống tạm thời gặp sự cố khi tạo câu trả lời._"
 
     @staticmethod
     def attach_resolved_citations(

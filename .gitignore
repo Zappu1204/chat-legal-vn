@@ -28,6 +28,7 @@ qdrant_storage/
 elastic_data/
 neo4j_data/
 neo4j_logs/
+postgre*
 .DS_Store
 
 # Temp

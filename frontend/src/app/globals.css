@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+  }
+}
+
+@layer components {
+  /* Markdown-rendered IRAC answer styling. Each H2 section gets a left
+     accent rule so Issue / Rule / Application / Conclusion read distinctly. */
+  .irac h2 {
+    @apply mt-5 mb-2 border-l-4 border-brand-500 pl-3 font-serif text-lg font-semibold text-slate-900;
+  }
+  .irac h3 {
+    @apply mt-4 mb-1 font-semibold text-slate-800;
+  }
+  .irac p {
+    @apply my-2 leading-relaxed text-slate-700;
+  }
+  .irac ul {
+    @apply my-2 list-disc space-y-1 pl-5 text-slate-700;
+  }
+  .irac ol {
+    @apply my-2 list-decimal space-y-1 pl-5 text-slate-700;
+  }
+  .irac strong {
+    @apply font-semibold text-slate-900;
+  }
+  .irac blockquote {
+    @apply my-3 rounded-r-md border-l-4 border-amber-400 bg-amber-50 px-4 py-2 text-amber-800;
+  }
+  .irac code {
+    @apply rounded bg-slate-100 px-1 py-0.5 text-sm text-brand-700;
+  }
+}
+
+/* Respect reduced-motion preferences for all animated elements. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

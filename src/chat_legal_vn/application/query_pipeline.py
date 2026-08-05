@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -50,6 +50,7 @@ from ..services.answer import AnswerEngine
 from ..services.fusion import alpha_fusion, rrf
 from ..services.metadata_lookup import filter_in_path, lookup_by_citation
 from ..services.query_planner import QueryPlanner
+from ..services.recency import apply_effective_bias
 
 log = get_logger(__name__)
 
@@ -76,6 +77,45 @@ class QueryResult:
     timings: dict[str, float]
 
 
+@dataclass(slots=True)
+class _Prepared:
+    """Internal result of the shared retrieval stages."""
+
+    plan: QueryPlan
+    retrieved: list[RetrievalCandidate]
+    reranked: list[RetrievalCandidate]
+    expanded: list[RetrievalCandidate]
+    retained: list[RetrievalCandidate]
+    parents: dict[str, ParentChunk]
+
+
+@dataclass(slots=True)
+class StreamHandle:
+    """Handle returned by :meth:`QueryPipeline.run_stream`.
+
+    Exposes the retrieved evidence up front (for an immediate ``sources``
+    event) and a coroutine factory ``answer_deltas`` that yields Markdown
+    text deltas. ``citations`` and ``warnings`` are populated only after
+    the stream is fully consumed.
+    """
+
+    engine: Any  # AnswerEngine — typed as Any to avoid a domain import cycle
+    plan: QueryPlan
+    retained: list[RetrievalCandidate]
+    parents: dict[str, ParentChunk]
+    timings: dict[str, float]
+    started_at: float
+
+    async def answer_deltas(self) -> AsyncIterator[str]:
+        async for delta in self.engine.stream_answer(
+            query=self.plan.normalized,
+            candidates=self.retained,
+            parents=self.parents,
+        ):
+            yield delta
+        self.timings["total"] = time.perf_counter() - self.started_at
+
+
 class QueryPipeline:
     """Top-level orchestrator for the online QA flow."""
 
@@ -87,6 +127,8 @@ class QueryPipeline:
             decompose_enabled=deps.settings.query_decompose_enabled,
             hyde_enabled=deps.settings.query_hyde_enabled,
             hyde_num=deps.settings.query_hyde_num,
+            hyde_temperature=deps.settings.query_hyde_temperature,
+            cache_size=deps.settings.query_plan_cache_size,
         )
         self._answer_engine = AnswerEngine(llm=deps.llm)
 
@@ -98,6 +140,82 @@ class QueryPipeline:
         timings: dict[str, float] = {}
         t0 = time.perf_counter()
 
+        prep = await self._prepare(query, timings, t0)
+        plan = prep.plan
+        retained = prep.retained
+        parents = prep.parents
+
+        # 5. Answer engine.
+        t5 = time.perf_counter()
+        answer = await self._answer_engine.answer(
+            query=plan.normalized,
+            candidates=retained,
+            parents=parents,
+        )
+        timings["answer"] = time.perf_counter() - t5
+
+        # 6. Citation resolution.
+        t6 = time.perf_counter()
+        answer = self._resolve_citations(answer, retained, parents)
+        timings["resolve"] = time.perf_counter() - t6
+
+        timings["total"] = time.perf_counter() - t0
+
+        log.info(
+            "query.completed",
+            query=query,
+            sub_queries=[s.text for s in plan.sub_queries],
+            retrieved=len(prep.retrieved),
+            reranked=len(prep.reranked),
+            expanded=len(prep.expanded),
+            retained=len(retained),
+            confidence=answer.confidence,
+            needs_human_review=answer.needs_human_review,
+            timings=timings,
+        )
+
+        return QueryResult(
+            answer=answer,
+            plan=plan,
+            retrieved=prep.retrieved,
+            reranked=prep.reranked,
+            expanded=prep.expanded,
+            timings=timings,
+        )
+
+    async def run_stream(self, query: str) -> StreamHandle:
+        """Run retrieval, then expose sources + a token stream for the answer.
+
+        The returned :class:`StreamHandle` carries the retrieved/retained
+        candidates and hydrated parents (so the API can emit a ``sources``
+        event immediately) plus an async generator ``answer_deltas`` that
+        yields Markdown text as the LLM produces it. Citations are parsed
+        from the accumulated text after the stream completes.
+        """
+        timings: dict[str, float] = {}
+        t0 = time.perf_counter()
+        prep = await self._prepare(query, timings, t0)
+        return StreamHandle(
+            engine=self._answer_engine,
+            plan=prep.plan,
+            retained=prep.retained,
+            parents=prep.parents,
+            timings=timings,
+            started_at=t0,
+        )
+
+    async def _prepare(
+        self,
+        query: str,
+        timings: dict[str, float],
+        t0: float,
+    ) -> _Prepared:
+        """Shared retrieval → rerank → graph → hydrate stages.
+
+        Used by both :meth:`run` (blocking JSON answer) and
+        :meth:`run_stream` (token streaming). Returns everything needed to
+        produce an answer without re-running retrieval.
+        """
         plan = await self._planner.plan(query)
         timings["plan"] = time.perf_counter() - t0
 
@@ -156,6 +274,21 @@ class QueryPipeline:
                 )
                 reranked = anchored
 
+        # 2c. Effective-status bias. Re-weight the reranked list so
+        # currently-in-force law outranks superseded versions of the same
+        # subject. Skip when the user explicitly anchored a citation
+        # (so_ky_hieu) — they asked for that specific document regardless
+        # of status.
+        if not plan.filter.so_ky_hieu and reranked:
+            biased = apply_effective_bias(self._settings, reranked)
+            if biased and biased[0].chunk_id != reranked[0].chunk_id:
+                log.info(
+                    "rerank.effective_bias_applied",
+                    new_top_status=(biased[0].metadata or {}).get("effective_status"),
+                    new_top_skh=(biased[0].metadata or {}).get("so_ky_hieu"),
+                )
+            reranked = biased
+
         # 3. Optional graph expansion + re-rank.
         t3 = time.perf_counter()
         expanded = await self._graph_expand(plan, reranked)
@@ -167,42 +300,13 @@ class QueryPipeline:
         parents = await self._hydrate_parents(retained)
         timings["hydrate"] = time.perf_counter() - t4
 
-        # 5. Answer engine.
-        t5 = time.perf_counter()
-        answer = await self._answer_engine.answer(
-            query=plan.normalized,
-            candidates=retained,
-            parents=parents,
-        )
-        timings["answer"] = time.perf_counter() - t5
-
-        # 6. Citation resolution.
-        t6 = time.perf_counter()
-        answer = self._resolve_citations(answer, retained, parents)
-        timings["resolve"] = time.perf_counter() - t6
-
-        timings["total"] = time.perf_counter() - t0
-
-        log.info(
-            "query.completed",
-            query=query,
-            sub_queries=[s.text for s in plan.sub_queries],
-            retrieved=len(retrieved),
-            reranked=len(reranked),
-            expanded=len(expanded),
-            retained=len(retained),
-            confidence=answer.confidence,
-            needs_human_review=answer.needs_human_review,
-            timings=timings,
-        )
-
-        return QueryResult(
-            answer=answer,
+        return _Prepared(
             plan=plan,
             retrieved=retrieved,
             reranked=reranked,
             expanded=expanded,
-            timings=timings,
+            retained=retained,
+            parents=parents,
         )
 
     # ------------------------------------------------------------------
@@ -328,7 +432,41 @@ class QueryPipeline:
     ) -> list[RetrievalCandidate]:
         if not candidates:
             return []
-        documents = [c.body or c.metadata.get("text", "") for c in candidates]
+        # Cross-encode against the FULL article (parent) text, not the bare
+        # leaf clause. A Điểm body is often a fragment like "Không chấp
+        # hành hiệu lệnh của đèn tín hiệu giao thông;" — it carries neither
+        # the penalty amount nor the "xe mô tô" subject (both live in the
+        # parent Điều / sibling Khoản), so the reranker scores it below an
+        # unrelated document that shares more surface tokens. Reranking on
+        # the parent body gives the model the penalty + subject context and
+        # matches the evidence the answer engine ultimately reads.
+        #
+        # We fetch each parent once and cap its length to the reranker's
+        # budget. Fallbacks: text_for_embedding (payload ``text``) → body.
+        parent_ids = sorted(
+            {c.parent_chunk_id for c in candidates if c.parent_chunk_id}
+        )
+        parents: dict[str, Any] = {}
+        if parent_ids:
+            try:
+                fetched = await self._deps.doc_store.get_many(parent_ids)
+                parents = {p.parent_chunk_id: p for p in fetched}
+            except Exception as exc:
+                log.warning("rerank.parent_hydrate_failed", error=str(exc))
+
+        def _doc_text(c: RetrievalCandidate) -> str:
+            parent = parents.get(c.parent_chunk_id)
+            if parent is not None and parent.body:
+                # Cap the parent body so a 13k-char article doesn't blow
+                # the reranker latency budget (cross-encoders are O(len)).
+                # The first ~2k chars of a Vietnamese article reliably
+                # contain the subject ("người điều khiển xe mô tô...") and
+                # the penalty band, which is what the reranker needs.
+                body = parent.body[:2000]
+                return f"{c.hierarchical_path}\n{body}"
+            return (c.metadata or {}).get("text") or c.body or ""
+
+        documents = [_doc_text(c) for c in candidates]
         try:
             scores = await self._deps.reranker.rerank(
                 query=query,
@@ -339,14 +477,39 @@ class QueryPipeline:
             log.warning("rerank.failed_fallback", error=str(exc))
             return list(candidates)[: self._settings.reranker_top_k]
 
+        # Blend the cross-encoder score with the candidate's *retrieval*
+        # rank. The Qwen3 reranker under vLLM is poorly calibrated for a
+        # handful of documents — some unrelated texts score 0.7-0.8 against
+        # ANY query. Those docs almost always sit deep in the hybrid
+        # retrieval ranking, so adding a small reciprocal-rank prior from
+        # retrieval ("this doc was the Nth best hybrid hit") demotes the
+        # mis-calibrated outliers without hurting genuine top hits. The
+        # candidates arrive pre-sorted by fusion, so their list index *is*
+        # the retrieval rank.
+        blend = max(0.0, min(1.0, self._settings.rerank_retrieval_blend))
+        rrf_k = self._settings.hybrid_rrf_k
         threshold = self._settings.reranker_threshold
-        out: list[RetrievalCandidate] = []
+        scored: list[tuple[int, float, float]] = []  # (idx, rerank, blended)
+        top_rerank_idx = scores[0][0] if scores else -1
         for idx, score in scores:
-            if score < threshold and idx != scores[0][0]:
-                # Top-1 is always preserved (Requirement 8.5)
-                continue
-            cand = candidates[idx].model_copy(update={"score": score, "source": "rerank"})
-            out.append(cand)
+            retrieval_prior = 1.0 / (rrf_k + idx + 1)  # idx is 0-based rank
+            blended = (1.0 - blend) * score + blend * retrieval_prior * rrf_k
+            scored.append((idx, score, blended))
+
+        # Keep candidates above the cross-encoder threshold (top-1 always
+        # preserved), then order by the blended score.
+        kept = [
+            (idx, rer, bl)
+            for (idx, rer, bl) in scored
+            if rer >= threshold or idx == top_rerank_idx
+        ]
+        kept.sort(key=lambda t: (-t[2], candidates[t[0]].chunk_id))
+
+        out: list[RetrievalCandidate] = []
+        for idx, rer, _bl in kept:
+            out.append(
+                candidates[idx].model_copy(update={"score": rer, "source": "rerank"})
+            )
 
         # Diversity-aware selection
         out = self._diversify(out, max_per_parent=self._settings.diversity_max_per_parent)

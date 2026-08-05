@@ -45,6 +45,15 @@ class QdrantParentDocStore(DocStoreAdapter):
             vectors_config=qm.VectorParams(size=1, distance=qm.Distance.DOT),
         )
 
+    async def recreate_collection(self) -> None:
+        """Drop and recreate the parent-doc collection for a clean re-ingest."""
+        with contextlib.suppress(Exception):
+            await self._client.delete_collection(self._collection)
+        await self._client.create_collection(
+            collection_name=self._collection,
+            vectors_config=qm.VectorParams(size=1, distance=qm.Distance.DOT),
+        )
+
     async def upsert(self, parents: Sequence[ParentChunk]) -> None:
         if not parents:
             return
